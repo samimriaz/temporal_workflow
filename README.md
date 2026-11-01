@@ -7,7 +7,7 @@ An order goes through four steps:
 
 The demo shows durable execution, worker restart, two workers processing orders
 in parallel, worker takeover, retryable API failures, and non-retryable invalid
-payments. The original banking example has been replaced with shopping.
+payments.
 
 Payment, inventory, and delivery are **simulated local API operations**, not HTTP
 calls to real providers. SQLite stores their durable state. No real payment is
@@ -105,7 +105,7 @@ sequenceDiagram
     Note over A: Worker stops before acknowledgement
     Note over T: Heartbeat timeout and retry scheduling
     T->>B: Payment activity, attempt 2
-    B->>S: Check existing payment; do not charge again
+    B->>S: Check existing payment and do not charge again
     B-->>T: Activity completed
     T->>B: Workflow task with payment result
     Note over T,B: Continue inventory and delivery
@@ -432,8 +432,7 @@ temporary shop databases; they do not reset demonstration stock or orders.
   handling, authentication, production monitoring, and real integrations are not
   implemented.
 - The dev server is not a production deployment. Preserve both databases for
-  recovery. Keep the old banking database separately if needed; shopping workers
-  do not execute old banking workflow types.
+  recovery.
 
 ## Resources
 
