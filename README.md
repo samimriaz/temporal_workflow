@@ -1,280 +1,439 @@
-# Temporal Banking Workflow (Python)
+# Temporal Shopping Workflow (Python)
 
-A local, simulated bank-transfer demo built with Python and
-[open-source Temporal](https://temporal.io/). It shows how to coordinate a
-multi-step operation when a bank is temporarily unavailable, rejects a transfer,
-or a worker stops after committing a transaction.
+A runnable shopping-order demo using Python and **open-source Temporal locally**.
+An order goes through four steps:
 
-The feature is a transfer from one account to another: **debit the sender, credit
-the recipient, and reconcile the ledger if an operation fails**. Temporal manages
-the orchestration, retries, and execution history; SQLite simulates the bank.
-No real money moves, no external banking API is called, and no Temporal Cloud
-account or subscription is required.
+**Receive order -> deduct payment -> check/reserve inventory -> deliver product.**
+
+The demo shows durable execution, worker restart, two workers processing orders
+in parallel, worker takeover, retryable API failures, and non-retryable invalid
+payments. The original banking example has been replaced with shopping.
+
+Payment, inventory, and delivery are **simulated local API operations**, not HTTP
+calls to real providers. SQLite stores their durable state. No real payment is
+charged or product shipped, and no Temporal Cloud account is required.
 
 ## Features
 
-- Transfer integer amounts in cents between the demo accounts `alice` and `bob`.
-  Each account starts with 10,000 cents when a new ledger is initialized.
-- Retry temporary bank outages with exponential backoff.
-- Refund a debit when the destination bank permanently rejects the credit.
-- Recover from a banking worker stopping after credit commits but before Temporal
-  receives its completion.
-- Use transfer IDs and transactional ledger state to make repeated operations
-  idempotent rather than debit or credit twice.
-- Run orchestration and banking activities in separate worker processes.
-- Inspect workflow history in Temporal's Web UI and balances through the CLI.
+- A single worker process runs both workflow orchestration and all activities.
+- A second identical worker shares the task queue and can execute other orders
+  or take over an interrupted activity.
+- Temporary API failures retry with exponential backoff, within a **30-minute
+  budget per step** by default.
+- An invalid payment is non-retryable: the order fails after one payment attempt.
+- Inventory or delivery failure refunds a charged payment and releases any
+  reserved stock before failing the workflow.
+- Idempotent operations prevent duplicate payment, stock reservation, and
+  delivery when an activity executes again after a lost acknowledgement.
+- Real Temporal UI screenshots below show timelines and failure/recovery results.
 
-## Why Temporal is used
+## How Temporal is used
 
-A regular script can lose track of a transfer if it stops between debit and
-credit. This project makes the transfer a **durable workflow**. Temporal records
-workflow history, schedules tasks, and manages activity retry timers. The Python
-workers execute the actual application code.
-
-Workflow code is deterministic orchestration: it decides which activity to run
-next and how to react to failure. Activities perform side effects, including
-SQLite transactions. A restarted workflow worker can reconstruct workflow
-progress by replaying history; completed activities recorded in history are not
-rerun just because the workflow is replayed.
-
-An activity can still execute more than once if its result is not acknowledged.
-Temporal does **not** make external side effects exactly-once. The ledger's
-idempotency checks handle that case.
-
-## Architecture and worker responsibilities
+Temporal's server persists workflow history, routes tasks, and manages retry
+timers and timeouts. The **workers**, not the server, execute the Python code.
 
 ```mermaid
 flowchart LR
-    CLI["CLI: start transfer and await result"] -->|Client API| T["Local Temporal server"]
-    T <-->|"banking-workflows task queue"| W["Workflow worker: BankTransfer"]
-    T <-->|"banking-activities task queue"| A["Banking worker: debit, credit, reconcile"]
-    A -->|SQLite transactions| DB[("Bank ledger: data/bank.db")]
-    UI["Temporal Web UI"] -->|Inspect workflow history| T
+    C["Order CLI"] -->|"SDK: start_workflow"| T["Local Temporal server"]
+    T <-->|"shopping-orders queue"| A["Worker A: workflow + activities"]
+    T <-->|"Same queue"| B["Optional worker B: workflow + activities"]
+    A --> S[("Shared SQLite shop database")]
+    B --> S
+    U["Temporal Web UI: timeline and history"] --> T
 ```
 
-Workers poll Temporal for tasks; they do not call each other directly. A task
-queue is a routing name, not a separate server or a Python thread. All clients and
-workers use the same Temporal server and namespace.
+Both workers register the same workflow and activities. **An order is not pinned
+to a worker**: successive tasks may run on different workers. Each worker allows
+one activity at a time to make the two-worker parallelism demonstration clear.
+It can still process workflow tasks while an activity is running.
 
-| Component | Responsibility | How it uses Temporal |
-| --- | --- | --- |
-| Transfer CLI in [banking/cli.py](banking/cli.py) | Builds a `Transfer`, starts it, and prints the final result. | `Client.connect()` connects to the server. `client.start_workflow()` starts `BankTransfer.run` on `banking-workflows`; `handle.result()` waits for completion. |
-| Workflow worker in [banking/worker.py](banking/worker.py) | Runs durable orchestration, not database operations. | `Worker(..., workflows=[BankTransfer])` polls `banking-workflows`. The workflow uses `workflow.execute_activity()` to schedule banking tasks. |
-| Banking worker in [banking/worker.py](banking/worker.py) | Executes bank operations and initializes the ledger if needed. | `Worker(..., activities=[...])` polls `banking-activities`, executes registered activities, and reports their results or failures through the SDK. |
-| Activities in [banking/activities.py](banking/activities.py) | Run `debit`, `credit`, and `reconcile`; simulate failures. | `@activity.defn` registers operations. `activity.info().attempt` identifies retry attempts; `ApplicationError` distinguishes retryable outages from non-retryable business rejections. |
-| Ledger in [banking/ledger.py](banking/ledger.py) | Validates requests and changes balances and transfer state atomically. | No Temporal calls. Synchronous SQLite operations run through a thread pool in the banking worker. |
-| Local Temporal server | Stores workflow history, routes tasks, and manages retries and timeouts. | Runs separately with `temporal server start-dev`; it does not execute the Python bank code. |
+| Component | Role and Temporal calls |
+| --- | --- |
+| [shopping/cli.py](shopping/cli.py) | `Client.connect()` and `client.start_workflow()` submit `ShoppingOrder` on `shopping-orders`. With `--wait`, `handle.result()` waits for success or raises a workflow failure. `init` and `inspect` access SQLite directly. |
+| [shopping/worker.py](shopping/worker.py) | Connects to Temporal, registers `ShoppingOrder` and all five activities in one `Worker`, then polls the shared queue. `--identity` labels the worker in history and logs. |
+| [shopping/workflows.py](shopping/workflows.py) | Uses `workflow.execute_activity()` to schedule the four steps and compensation. Defines retry policies, timeouts, and the failure/recovery path. |
+| [shopping/activities.py](shopping/activities.py) | `@activity.defn` exposes the simulated APIs. Uses `activity.info().attempt` to simulate transient outages, sends heartbeats, and reports errors through `ApplicationError`. |
+| [shopping/store.py](shopping/store.py) | Applies idempotent SQLite transactions and records each activity's worker, attempt, phase, and UTC timestamp. No Temporal calls. |
+| [shopping/models.py](shopping/models.py) | Order input/result dataclasses, scenario names, validation, and the queue name. |
 
-The CLI's `init` and `balances` commands access SQLite directly and do not call
-Temporal. The thread pool has four threads for ledger operations; it is not an
-additional Temporal worker.
+The server's workflow history and the shop database are **separate stores**.
+The former remembers orchestration; the latter remembers external side effects.
+Both must survive worker restarts.
 
-## Transfer workflow
-
-The workflow is defined in [banking/workflows.py](banking/workflows.py).
+## Workflow and failure path
 
 ```mermaid
 flowchart TD
-    START["CLI starts BankTransfer"] --> DEBIT["debit activity"]
-    DEBIT -->|Success| SETTLED{"Already refunded or rejected?"}
-    SETTLED -->|Yes| EXISTING["Return existing settled status"]
-    SETTLED -->|No| CREDIT["credit activity"]
-    CREDIT -->|Success| DONE["Return completed"]
-    DEBIT -->|ActivityError| REC["reconcile activity"]
-    CREDIT -->|ActivityError| REC
-    REC --> STATE{"Ledger state"}
-    STATE -->|completed| KEEP["Keep credit; return completed"]
-    STATE -->|debited| REFUND["Refund sender; return refunded"]
-    STATE -->|pending| REJECT["Mark rejected; return rejected"]
-    STATE -->|refunded or rejected| UNCHANGED["Return existing status"]
+    R["Receive order"] --> P["Deduct payment"]
+    P --> I["Check inventory and reserve stock"]
+    I --> D["Deliver product"]
+    D --> OK["Workflow completed: delivered"]
+    R -->|Activity ultimately fails| C["Compensate"]
+    P -->|Invalid payment or retry budget exhausted| C
+    I -->|Out of stock or retry budget exhausted| C
+    D -->|Retry budget exhausted| C
+    C --> CHECK{"Already delivered?"}
+    CHECK -->|Yes: delivery committed before timeout| OK
+    CHECK -->|No| REF["Refund charged payment and release reserved stock"]
+    REF --> FAIL["Workflow failed: OrderFailed"]
 ```
 
-The failure arrows apply when Temporal reports an activity failure, for example
-after retries are exhausted, a timeout expires, or a non-retryable rejection
-occurs. Reconciliation first checks the ledger: a timeout does not prove that a
-bank transaction failed to commit.
+Retryable failures stay within the same activity until it succeeds or its
+overall deadline expires. The failure arrows do not run after every failed
+attempt. An invalid payment or other business rejection skips retries.
 
-### Calls for a successful transfer
+Compensation checks durable state first. A timeout is not proof that an API
+operation did not commit. Already delivered orders are not refunded.
 
 ```mermaid
 sequenceDiagram
-    participant C as Transfer CLI
-    participant T as Temporal server
-    participant W as Workflow worker
-    participant A as Banking worker
-    participant L as SQLite ledger
-    C->>T: start_workflow(BankTransfer, Transfer)
-    T->>W: Workflow task via banking-workflows
-    W->>T: Schedule debit via banking-activities
-    T->>A: debit activity task
-    A->>L: Debit sender and persist debited state
-    L-->>A: debited
+    participant C as CLI
+    participant T as Temporal
+    participant A as Combined worker A
+    participant S as Shop database
+    participant B as Combined worker B
+    C->>T: Start ShoppingOrder
+    T->>A: Workflow task
+    A->>T: Schedule receive_order
+    T->>A: Activity task
+    A->>S: Persist order
     A-->>T: Activity completed
-    T->>W: Workflow task with debit result
-    W->>T: Schedule credit via banking-activities
-    T->>A: credit activity task
-    A->>L: Credit recipient and persist completed state
-    L-->>A: completed
-    A-->>T: Activity completed
-    T->>W: Workflow task with credit result
-    W-->>T: Complete workflow with TransferResult
-    T-->>C: handle.result() returns final result
+    T->>A: Workflow task
+    A->>T: Schedule deduct_payment
+    T->>A: Payment activity, attempt 1
+    A->>S: Persist charged payment
+    Note over A: Worker stops before acknowledgement
+    Note over T: Heartbeat timeout and retry scheduling
+    T->>B: Payment activity, attempt 2
+    B->>S: Check existing payment; do not charge again
+    B-->>T: Activity completed
+    T->>B: Workflow task with payment result
+    Note over T,B: Continue inventory and delivery
 ```
 
-### Retry and timeout settings
+With only one worker, the retry waits until that worker restarts. With another
+healthy worker on the same queue, no manual reassignment is needed. Workflow
+code replays history to reconstruct progress; completed activities recorded in
+history do not rerun just because of replay. Unacknowledged activities can rerun,
+so side-effect idempotency remains essential.
 
-- **Debit and credit:** up to four attempts each, including the first attempt.
-  Retry intervals start at one second, double, and are capped at four seconds.
-- **Per-attempt timeout:** 30 seconds (`start_to_close_timeout`).
-- **Overall debit/credit timeout:** five minutes per activity
-  (`schedule_to_close_timeout`), including queue waits and retries.
-- **Business rejection:** a `BankError` becomes a non-retryable `BankRejection`
-  and triggers reconciliation without retrying that rejected operation.
-- **Reconciliation:** 30 seconds per attempt, with retry intervals capped at ten
-  seconds. No maximum attempt count or overall timeout is configured, so retryable
-  reconciliation failures can keep the workflow running. A non-retryable error
-  in reconciliation fails the workflow rather than returning a settled result.
+## Where failure policies are defined
 
-### Ledger states and idempotency
+In [shopping/workflows.py](shopping/workflows.py), every normal step uses:
 
-Normal state progression is `pending -> debited -> completed`. Compensation
-changes `debited -> refunded`; reconciliation before a debit commits changes
-`pending -> rejected`. Completed, refunded, and rejected transfers stay settled.
+```python
+RetryPolicy(
+    initial_interval=timedelta(seconds=2),
+    backoff_coefficient=2,
+    maximum_interval=timedelta(seconds=30),
+    maximum_attempts=0,
+)
+```
 
-Each ledger transaction updates balances and transfer state together. Repeated
-calls check that state and do not repeat a completed money movement. A transfer
-ID cannot be reused with different request details.
+| Policy | Behavior |
+| --- | --- |
+| Overall activity deadline | `schedule_to_close_timeout=order.retry_seconds`; default 1,800 seconds (30 minutes), including queue waits, attempts, and backoff. This is per step, not a 30-minute limit for the whole order. |
+| Attempts | No fixed attempt limit; retries are bounded by the overall deadline. Backoff starts at 2 seconds, doubles, and caps at 30 seconds. |
+| Execution attempt timeout | Normally 20 seconds; increases for configured demonstration delays, never above the activity's overall budget. |
+| Heartbeat timeout | 5 seconds. Activities heartbeat during simulated API and acknowledgement delays so a stopped worker's task can be retried. Detection and reassignment are not instantaneous. |
+| Invalid payment | The activity raises `ApplicationError(..., type="ShopRejection", non_retryable=True)`. The workflow compensates, then raises non-retryable `OrderFailed`. |
+| Compensation | Uses a 20-second attempt timeout and retries with no overall deadline, so it can keep the workflow running until retryable infrastructure failures recover. A terminal compensation error fails the workflow. |
 
-The CLI gives the workflow the ID `transfer-<transfer_id>` and sets
-`WorkflowIDReusePolicy.REJECT_DUPLICATE`. Use a new transfer ID for each new demo
-run; omitting `--id` generates a UUID.
+`--retry-seconds` deliberately permits a shorter demonstration budget. **The
+20-second exhaustion screenshot is not evidence of a real 30-minute outage run.**
+The default 1,800-second policy was verified in actual Temporal history and is
+visible in the policy screenshot. Tests use eight seconds for exhaustion.
 
-## Setup and running the demo
+## Setup
 
-Prerequisites: Python 3.10 or newer, the
-[Temporal CLI](https://docs.temporal.io/cli), and PowerShell.
-Run all Python commands below from this project directory. The explicit virtual
-environment interpreter avoids PowerShell activation-policy issues.
+Prerequisites: Python 3.10+, PowerShell, and the
+[Temporal CLI](https://github.com/temporalio/cli/releases).
+Run commands from this project directory.
 
-### 1. Install the project
+### 1. Install the Python project
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e .
 ```
 
-Dependencies are declared in [pyproject.toml](pyproject.toml), including
-`temporalio>=1.9,<2`.
-
-### 2. Start Temporal in a separate terminal
+For tests and linting:
 
 ```powershell
-temporal server start-dev --db-filename temporal-dev.db
+.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
 ```
 
-The database flag preserves local workflow history across server restarts.
-Without it, `temporal server start-dev` runs an in-memory development server.
-Temporal's database is separate from the bank ledger.
+### 2. Install Temporal CLI if it is missing
+
+If `temporal` is already on your PATH, use it instead of `.\.tools\temporal.exe`.
+For Windows x64, this installs the same official version used for the screenshots:
+
+```powershell
+New-Item -ItemType Directory -Force .tools | Out-Null
+Invoke-WebRequest `
+  -Uri "https://github.com/temporalio/cli/releases/download/v1.9.1/temporal_cli_1.9.1_windows_amd64.zip" `
+  -OutFile ".tools\temporal.zip"
+Expand-Archive ".tools\temporal.zip" -DestinationPath ".tools" -Force
+.\.tools\temporal.exe --version
+```
+
+For other platforms or architectures, use the matching official release.
+
+### 3. Initialize the shop and start Temporal
+
+```powershell
+.\.venv\Scripts\python.exe -m shopping.cli init
+.\.tools\temporal.exe server start-dev --db-filename data\temporal-shopping.db
+```
+
+Initialization creates the shop database and seeds 100 headphones. It does not
+reset existing orders or stock. Keep this server terminal running.
 
 | Setting | Default |
 | --- | --- |
-| Temporal server | `localhost:7233` |
+| Temporal endpoint / namespace | `localhost:7233` / `default` |
 | Temporal Web UI | <http://localhost:8233> |
-| Namespace | `default` |
-| Workflow task queue | `banking-workflows` |
-| Activity task queue | `banking-activities` |
-| Bank ledger | `data/bank.db` |
+| Shared task queue | `shopping-orders` |
+| Simulated shop database | `data/shop.db` |
+| Persisted server database in these instructions | `data/temporal-shopping.db` |
+| Order | One pair of headphones, payment amount 2,500 cents |
 
-### 3. Initialize the bank ledger
-
-```powershell
-.\.venv\Scripts\python.exe -m banking.cli init
-```
-
-Initialization creates missing tables and accounts; it does not reset existing
-balances or transfers.
-
-### 4. Start both workers in separate terminals
-
-Workflow worker:
+### 4. Start one combined worker in a second terminal
 
 ```powershell
-.\.venv\Scripts\python.exe -m banking.worker workflow
+.\.venv\Scripts\python.exe -m shopping.worker --identity worker-A
 ```
 
-Banking activity worker:
+Wait for `READY`. Logs identify the worker, its process ID, order, activity step,
+attempt number, and when a side effect commits.
+
+### 5. Submit an order in a third terminal
 
 ```powershell
-.\.venv\Scripts\python.exe -m banking.worker banking
+.\.venv\Scripts\python.exe -m shopping.cli order --id first-order --wait
+.\.venv\Scripts\python.exe -m shopping.cli inspect --id first-order
 ```
 
-Keep the Temporal server and both workers running.
+The CLI prints a workflow ID (`order-first-order`) and run ID. Without `--wait`
+it returns immediately, which is useful for submitting concurrent orders.
+With `--wait`, failed orders print an error and exit with status 1.
 
-### 5. Start a transfer and inspect the result
+Use a unique ID for each new run, or omit `--id` to generate a UUID. The CLI
+rejects workflow ID reuse. Workers and order submissions accept `--address` and
+`--task-queue`; workers and `init`/`inspect` accept `--database`. All workers
+sharing a queue must use the same durable shop database.
+
+## Demonstrations
+
+### A. One worker: follow the complete timeline
 
 ```powershell
-.\.venv\Scripts\python.exe -m banking.cli transfer --scenario success --amount-cents 1000
-.\.venv\Scripts\python.exe -m banking.cli balances
+.\.venv\Scripts\python.exe -m shopping.cli order --id single-demo --step-seconds 4 --wait
 ```
 
-On a freshly initialized ledger, this moves 1,000 cents from Alice to Bob:
-Alice has 9,000 cents and Bob has 11,000 cents. The transfer command prints the
-workflow ID, waits for completion, then prints JSON with `transfer_id`, `status`,
-and `detail`. Open the Web UI to inspect the execution.
+Open the order in the UI, choose **Timeline**, and scroll below the input/result.
+The four activity bars show receive, payment, inventory, and delivery.
+**Event History** shows the scheduling, start, and completion events. Click a
+timeline activity to inspect its policy, executing worker identity, and attempts.
 
-The transfer CLI and both workers accept `--address` for a different Temporal
-endpoint. The banking worker and the `init`/`balances` commands accept
-`--database`; use the same ledger path for all banking operations.
-
-## Failure scenarios to try
-
-| Scenario | What happens | Expected result with valid accounts and sufficient funds |
-| --- | --- | --- |
-| `success` | Debit and credit succeed. | `completed` |
-| `transient` | Credit attempts 1 and 2 simulate a bank outage before changing the ledger. Temporal retries; attempt 3 credits the recipient. | `completed` |
-| `permanent` | The destination bank rejects credit after debit. The rejection is non-retryable; reconciliation refunds the sender. | `refunded` |
-| `crash-credit` | Credit commits on attempt 1, then delays its acknowledgement for 20 seconds so you can stop the banking worker. | `completed` after recovery, without a duplicate credit |
+### B. Stop and restart the only worker
 
 ```powershell
-.\.venv\Scripts\python.exe -m banking.cli transfer --scenario transient
-.\.venv\Scripts\python.exe -m banking.cli transfer --scenario permanent
-.\.venv\Scripts\python.exe -m banking.cli transfer --scenario crash-credit
+.\.venv\Scripts\python.exe -m shopping.cli order `
+  --id restart-demo --step-seconds 1 --acknowledgement-seconds 10
 ```
 
-For the crash demo, watch the banking worker for **CREDIT COMMITTED**. Stop only
-that worker with `Ctrl+C` during the 20-second delay, then restart it using the
-same database path. Keep the server and workflow worker running. If completion
-was not acknowledged, the activity can be retried after its attempt times out;
-the ledger returns `completed` without crediting Bob again. If you do not stop
-the worker, the activity simply completes after the delay.
+1. In the worker terminal, wait for `COMMITTED ... step=deduct_payment`.
+2. Stop that worker with `Ctrl+C` during the acknowledgement delay. For an abrupt
+   process crash, use PowerShell `Stop-Process -Id` with that worker's exact PID
+   from `READY`, not a process-name-wide command.
+3. Leave Temporal running. The UI keeps the order running and shows payment
+   awaiting retry. No worker is available to progress it.
+4. Restart `shopping.worker --identity worker-A` using the same database.
+5. Refresh the **same workflow/run**, not a newly submitted order. Payment retries
+   safely, then inventory and delivery finish. Receive order does not run again.
 
-Scenario runs share the ledger, so successful runs accumulate balance changes.
-These expected results assume reconciliation can access the ledger and does not
-itself encounter a terminal error.
+The acknowledgement delay applies to each normal step and is only a demonstration
+aid. Stopping before an API commits is also recoverable; its next attempt performs
+the operation normally.
 
-## Project files
+### C. Two workers, two orders in parallel
 
-| File | Contents |
+Keep A running and start B in another terminal:
+
+```powershell
+.\.venv\Scripts\python.exe -m shopping.worker --identity worker-B
+```
+
+Then submit two orders without waiting:
+
+```powershell
+.\.venv\Scripts\python.exe -m shopping.cli order --id parallel-1 --step-seconds 5
+.\.venv\Scripts\python.exe -m shopping.cli order --id parallel-2 --step-seconds 5
+```
+
+The workflow list can show both running. Compare each timeline and
+`shopping.cli inspect --id parallel-1` / `parallel-2`: overlapping UTC start
+times and different worker identities demonstrate actual parallel activity
+execution. Scheduling is not guaranteed to assign one entire order to each worker.
+
+### D. One of two workers fails: the other takes over
+
+With A and B running:
+
+```powershell
+.\.venv\Scripts\python.exe -m shopping.cli order `
+  --id takeover-demo --step-seconds 1 --acknowledgement-seconds 10
+```
+
+Watch which worker logs the committed payment. Stop **that worker only**, leaving
+the other worker and Temporal running. The surviving worker executes the retry
+after the heartbeat timeout/backoff and finishes the order. Inspect events to
+see the identity change; completed steps and committed side effects are preserved.
+
+### E. API outage that recovers
+
+```powershell
+.\.venv\Scripts\python.exe -m shopping.cli order `
+  --id api-recovers --scenario transient --fail-step check_inventory --wait
+```
+
+The selected API fails on attempts 1 and 2, then succeeds on attempt 3. The order
+is delivered. `--fail-step` can target `deduct_payment`, `check_inventory`, or
+`deliver_product`.
+
+### F. API stays unavailable until the retry budget expires
+
+Real 30-minute per-step budget:
+
+```powershell
+.\.venv\Scripts\python.exe -m shopping.cli order `
+  --id long-outage --scenario api-down --fail-step deliver_product --wait
+```
+
+Shortened version used for UI evidence:
+
+```powershell
+.\.venv\Scripts\python.exe -m shopping.cli order `
+  --id short-outage --scenario api-down --fail-step deliver_product `
+  --retry-seconds 20 --step-seconds 1 --wait
+```
+
+After delivery's budget expires, the workflow refunds payment, releases reserved
+stock, and fails. Total order duration includes earlier steps and compensation,
+so it can exceed the failing activity's budget.
+
+### G. Invalid payment: fail without retry
+
+```powershell
+.\.venv\Scripts\python.exe -m shopping.cli order `
+  --id declined-order --scenario invalid-payment --wait
+```
+
+Payment has exactly one attempt and no charge. Inventory and delivery never run.
+Compensation safely settles the received order without refunding money that was
+never charged. The UI shows a failed workflow, not a success-shaped result.
+`--scenario out-of-stock` similarly rejects inventory and refunds payment.
+
+## Actual UI results
+
+These are screenshots from real local executions, not mockups. Capture versions:
+Temporal CLI 1.9.1, server 1.32.0, UI 2.54.1, Python SDK 1.34.0.
+The screenshots retain local timestamps; store events use UTC.
+
+| Captured order | Observed result, verified against history/store |
 | --- | --- |
-| [banking/models.py](banking/models.py) | Transfer input/result dataclasses, scenarios, and task queue names. |
-| [banking/workflows.py](banking/workflows.py) | `BankTransfer` orchestration, retry policies, and compensation path. |
-| [banking/activities.py](banking/activities.py) | Temporal activity definitions and simulated outages/crash window. |
-| [banking/ledger.py](banking/ledger.py) | SQLite accounts, transfer state, validation, and idempotent transactions. |
-| [banking/worker.py](banking/worker.py) | Entrypoint for either the workflow worker or banking activity worker. |
-| [banking/cli.py](banking/cli.py) | Initialize the ledger, view balances, or start and await a transfer. |
-| [pyproject.toml](pyproject.toml) | Package metadata, dependencies, and development-tool configuration. |
+| `ui-single-worker` | Delivered; all four activities executed by worker-A. |
+| `ui-paused` | While A was stopped: running, charged payment, no inventory reservation. After restart: delivered in the same run; receive executed once, payment retried at attempt 2 without another charge. |
+| `ui-parallel-1`, `ui-parallel-2` | Both delivered. Receive activities started at `00:11:18.094Z` on B and `00:11:18.077Z` on A, before either completed. |
+| `ui-takeover` | Interrupted payment attempt 1 on B; surviving A ran attempt 2 and delivered the order. |
+| `ui-api-recovery` | Inventory attempts 1 and 2 failed; attempt 3 succeeded; delivered. |
+| `ui-invalid-payment` | Failed; one payment attempt; payment and inventory remained `none`. |
+| `ui-api-exhausted` | **20-second delivery budget**; four delivery attempts; workflow failed with payment `refunded` and inventory `released`. |
 
-## Scope and limitations
+### Single-worker timeline
 
-This is a learning demo, not a production banking system. It uses one local
-SQLite ledger, not transactions across independent real banks. It does not
-implement authentication, real bank integrations, or dedicated workflow
-cancellation handling. Automated tests have not been added yet.
+![One worker completes the four shopping activities](docs/images/01-single-worker.png)
 
-The local Temporal development server is not a production deployment. Durable
-recovery depends on preserving both Temporal history and the banking database.
-Keep database I/O in activities and maintain ledger idempotency when extending
-the demo; retries alone are not sufficient to prevent duplicate side effects.
+### Same order while stopped, then after restart
+
+The pending retry does not restart the order from the beginning.
+
+![Worker stopped: receive completed and payment attempt 2 waits](docs/images/02-worker-stopped.png)
+
+![Same order after restart: payment retry and remaining steps complete](docs/images/03-worker-restarted.png)
+
+### Two orders running, and takeover after a worker fails
+
+![Two shopping workflows running at the same time](docs/images/04-parallel-orders.png)
+
+The takeover timeline's `2` beside payment represents the retried activity.
+Store events confirm B performed attempt 1 and A performed attempt 2.
+
+![Surviving worker completes the retried payment and order](docs/images/05-worker-takeover.png)
+
+### API retries, terminal payment rejection, and exhausted budget
+
+![Inventory API recovers on attempt 3](docs/images/06-api-recovery.png)
+
+![Invalid payment fails once, followed by compensation](docs/images/07-invalid-payment.png)
+
+![Delivery exhausts a shortened 20-second budget and compensation completes](docs/images/08-api-exhausted.png)
+
+### Policy and worker identity in the UI
+
+The activity detail shows the real default **30-minute Schedule To Close Timeout**.
+
+![Temporal activity configuration shows a 30-minute budget](docs/images/09-retry-policy.png)
+
+The retried payment detail shows **worker-A, attempt 2**, with a previous heartbeat
+timeout and a successful `paid` result.
+
+![Activity attempt and worker identity after restart](docs/images/10-retry-identity.png)
+
+## Tests and validation
+
+With the demo server running:
+
+```powershell
+$env:TEMPORAL_TEST_ADDRESS = "localhost:7233"
+.\.venv\Scripts\python.exe -m pytest tests -q
+.\.venv\Scripts\python.exe -m ruff check shopping tests
+```
+
+Without an existing server, set `$env:TEMPORAL_CLI` to the absolute CLI executable
+path and omit `TEMPORAL_TEST_ADDRESS`; the tests start/stop an isolated dev server.
+
+- [tests/test_store.py](tests/test_store.py): idempotency, compensation fencing,
+  invalid requests/payment, changed-ID rejection, and concurrent stock reservation.
+- [tests/test_workflow.py](tests/test_workflow.py): real Temporal execution,
+  transient retry attempt counts, 1,800-second default policy in history,
+  shortened exhaustion, refunds/releases, interrupted commit takeover, and
+  overlapping execution on two workers.
+
+**Recorded validation: 22 tests passed; Ruff passed; Python syntax checks passed.**
+Pylance's file checks could not resolve the newly created modules in this session,
+so editor-side type validation is not claimed. Tests use unique queues and
+temporary shop databases; they do not reset demonstration stock or orders.
+
+## Limitations
+
+- This is a simulated shop, not a production payment or fulfillment system.
+  Payment is represented by durable state, and delivery by a delivered order;
+  there is no external processor or carrier.
+- Both workers must share this SQLite database on one machine. A distributed
+  deployment needs durable shared API/database infrastructure, not independent
+  local files per host.
+- Temporal activities are not exactly-once. Idempotency must also be implemented
+  in real payment, inventory, and delivery integrations.
+- A pending task can exhaust its overall budget while no workers are available.
+  Recovery is therefore bounded for normal steps, not unlimited.
+- Compensation can wait indefinitely on retryable failures. Dedicated cancellation
+  handling, authentication, production monitoring, and real integrations are not
+  implemented.
+- The dev server is not a production deployment. Preserve both databases for
+  recovery. Keep the old banking database separately if needed; shopping workers
+  do not execute old banking workflow types.
 
 ## Resources
 
