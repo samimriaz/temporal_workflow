@@ -144,6 +144,166 @@ RetryPolicy(
 The default 1,800-second policy was verified in actual Temporal history and is
 visible in the policy screenshot. Tests use eight seconds for exhaustion.
 
+## Demonstrations
+
+To run these scenarios, complete [Setup](#setup) first.
+
+The screenshots below are from real local executions, not mockups. Capture
+versions: Temporal CLI 1.9.1, server 1.32.0, UI 2.54.1, Python SDK 1.34.0.
+The screenshots retain local timestamps; store events use UTC.
+
+### A. One worker: follow the complete timeline
+
+```powershell
+.\.venv\Scripts\python.exe -m shopping.cli order --id single-demo --step-seconds 4 --wait
+```
+
+Open the order in the UI, choose **Timeline**, and scroll below the input/result.
+The four activity bars show receive, payment, inventory, and delivery.
+**Event History** shows the scheduling, start, and completion events. Click a
+timeline activity to inspect its policy, executing worker identity, and attempts.
+
+![One worker completes the four shopping activities](docs/images/01-single-worker.png)
+
+### B. Stop and restart the only worker
+
+```powershell
+.\.venv\Scripts\python.exe -m shopping.cli order `
+  --id restart-demo --step-seconds 1 --acknowledgement-seconds 10
+```
+
+1. In the worker terminal, wait for `COMMITTED ... step=deduct_payment`.
+2. Stop that worker with `Ctrl+C` during the acknowledgement delay. For an abrupt
+   process crash, use PowerShell `Stop-Process -Id` with that worker's exact PID
+   from `READY`, not a process-name-wide command.
+3. Leave Temporal running. The UI keeps the order running and shows payment
+   awaiting retry. No worker is available to progress it.
+4. Restart `shopping.worker --identity worker-A` using the same database.
+5. Refresh the **same workflow/run**, not a newly submitted order. Payment retries
+   safely, then inventory and delivery finish. Receive order does not run again.
+
+The acknowledgement delay applies to each normal step and is only a demonstration
+aid. Stopping before an API commits is also recoverable; its next attempt performs
+the operation normally.
+
+The pending retry does not restart the order from the beginning.
+
+![Worker stopped: receive completed and payment attempt 2 waits](docs/images/02-worker-stopped.png)
+
+![Same order after restart: payment retry and remaining steps complete](docs/images/03-worker-restarted.png)
+
+The activity detail shows the real default **30-minute Schedule To Close Timeout**.
+
+![Temporal activity configuration shows a 30-minute budget](docs/images/09-retry-policy.png)
+
+The retried payment detail shows **worker-A, attempt 2**, with a previous heartbeat
+timeout and a successful `paid` result.
+
+![Activity attempt and worker identity after restart](docs/images/10-retry-identity.png)
+
+### C. Two workers, two orders in parallel
+
+Keep A running and start B in another terminal:
+
+```powershell
+.\.venv\Scripts\python.exe -m shopping.worker --identity worker-B
+```
+
+Then submit two orders without waiting:
+
+```powershell
+.\.venv\Scripts\python.exe -m shopping.cli order --id parallel-1 --step-seconds 5
+.\.venv\Scripts\python.exe -m shopping.cli order --id parallel-2 --step-seconds 5
+```
+
+The workflow list can show both running. Compare each timeline and
+`shopping.cli inspect --id parallel-1` / `parallel-2`: overlapping UTC start
+times and different worker identities demonstrate actual parallel activity
+execution. Scheduling is not guaranteed to assign one entire order to each worker.
+
+![Two shopping workflows running at the same time](docs/images/04-parallel-orders.png)
+
+### D. One of two workers fails: the other takes over
+
+With A and B running:
+
+```powershell
+.\.venv\Scripts\python.exe -m shopping.cli order `
+  --id takeover-demo --step-seconds 1 --acknowledgement-seconds 10
+```
+
+Watch which worker logs the committed payment. Stop **that worker only**, leaving
+the other worker and Temporal running. The surviving worker executes the retry
+after the heartbeat timeout/backoff and finishes the order. Inspect events to
+see the identity change; completed steps and committed side effects are preserved.
+
+The takeover timeline's `2` beside payment represents the retried activity.
+Store events confirm B performed attempt 1 and A performed attempt 2.
+
+![Surviving worker completes the retried payment and order](docs/images/05-worker-takeover.png)
+
+### E. API outage that recovers
+
+```powershell
+.\.venv\Scripts\python.exe -m shopping.cli order `
+  --id api-recovers --scenario transient --fail-step check_inventory --wait
+```
+
+The selected API fails on attempts 1 and 2, then succeeds on attempt 3. The order
+is delivered. `--fail-step` can target `deduct_payment`, `check_inventory`, or
+`deliver_product`.
+
+![Inventory API recovers on attempt 3](docs/images/06-api-recovery.png)
+
+### F. API stays unavailable until the retry budget expires
+
+Real 30-minute per-step budget:
+
+```powershell
+.\.venv\Scripts\python.exe -m shopping.cli order `
+  --id long-outage --scenario api-down --fail-step deliver_product --wait
+```
+
+Shortened version used for UI evidence:
+
+```powershell
+.\.venv\Scripts\python.exe -m shopping.cli order `
+  --id short-outage --scenario api-down --fail-step deliver_product `
+  --retry-seconds 20 --step-seconds 1 --wait
+```
+
+After delivery's budget expires, the workflow refunds payment, releases reserved
+stock, and fails. Total order duration includes earlier steps and compensation,
+so it can exceed the failing activity's budget.
+
+![Delivery exhausts a shortened 20-second budget and compensation completes](docs/images/08-api-exhausted.png)
+
+### G. Invalid payment: fail without retry
+
+```powershell
+.\.venv\Scripts\python.exe -m shopping.cli order `
+  --id declined-order --scenario invalid-payment --wait
+```
+
+Payment has exactly one attempt and no charge. Inventory and delivery never run.
+Compensation safely settles the received order without refunding money that was
+never charged. The UI shows a failed workflow, not a success-shaped result.
+`--scenario out-of-stock` similarly rejects inventory and refunds payment.
+
+![Invalid payment fails once, followed by compensation](docs/images/07-invalid-payment.png)
+
+## Actual UI results
+
+| Captured order | Observed result, verified against history/store |
+| --- | --- |
+| `ui-single-worker` | Delivered; all four activities executed by worker-A. |
+| `ui-paused` | While A was stopped: running, charged payment, no inventory reservation. After restart: delivered in the same run; receive executed once, payment retried at attempt 2 without another charge. |
+| `ui-parallel-1`, `ui-parallel-2` | Both delivered. Receive activities started at `00:11:18.094Z` on B and `00:11:18.077Z` on A, before either completed. |
+| `ui-takeover` | Interrupted payment attempt 1 on B; surviving A ran attempt 2 and delivered the order. |
+| `ui-api-recovery` | Inventory attempts 1 and 2 failed; attempt 3 succeeded; delivered. |
+| `ui-invalid-payment` | Failed; one payment attempt; payment and inventory remained `none`. |
+| `ui-api-exhausted` | **20-second delivery budget**; four delivery attempts; workflow failed with payment `refunded` and inventory `released`. |
+
 ## Setup
 
 Prerequisites: Python 3.10+, PowerShell, and the
@@ -222,174 +382,6 @@ Use a unique ID for each new run, or omit `--id` to generate a UUID. The CLI
 rejects workflow ID reuse. Workers and order submissions accept `--address` and
 `--task-queue`; workers and `init`/`inspect` accept `--database`. All workers
 sharing a queue must use the same durable shop database.
-
-## Demonstrations
-
-### A. One worker: follow the complete timeline
-
-```powershell
-.\.venv\Scripts\python.exe -m shopping.cli order --id single-demo --step-seconds 4 --wait
-```
-
-Open the order in the UI, choose **Timeline**, and scroll below the input/result.
-The four activity bars show receive, payment, inventory, and delivery.
-**Event History** shows the scheduling, start, and completion events. Click a
-timeline activity to inspect its policy, executing worker identity, and attempts.
-
-### B. Stop and restart the only worker
-
-```powershell
-.\.venv\Scripts\python.exe -m shopping.cli order `
-  --id restart-demo --step-seconds 1 --acknowledgement-seconds 10
-```
-
-1. In the worker terminal, wait for `COMMITTED ... step=deduct_payment`.
-2. Stop that worker with `Ctrl+C` during the acknowledgement delay. For an abrupt
-   process crash, use PowerShell `Stop-Process -Id` with that worker's exact PID
-   from `READY`, not a process-name-wide command.
-3. Leave Temporal running. The UI keeps the order running and shows payment
-   awaiting retry. No worker is available to progress it.
-4. Restart `shopping.worker --identity worker-A` using the same database.
-5. Refresh the **same workflow/run**, not a newly submitted order. Payment retries
-   safely, then inventory and delivery finish. Receive order does not run again.
-
-The acknowledgement delay applies to each normal step and is only a demonstration
-aid. Stopping before an API commits is also recoverable; its next attempt performs
-the operation normally.
-
-### C. Two workers, two orders in parallel
-
-Keep A running and start B in another terminal:
-
-```powershell
-.\.venv\Scripts\python.exe -m shopping.worker --identity worker-B
-```
-
-Then submit two orders without waiting:
-
-```powershell
-.\.venv\Scripts\python.exe -m shopping.cli order --id parallel-1 --step-seconds 5
-.\.venv\Scripts\python.exe -m shopping.cli order --id parallel-2 --step-seconds 5
-```
-
-The workflow list can show both running. Compare each timeline and
-`shopping.cli inspect --id parallel-1` / `parallel-2`: overlapping UTC start
-times and different worker identities demonstrate actual parallel activity
-execution. Scheduling is not guaranteed to assign one entire order to each worker.
-
-### D. One of two workers fails: the other takes over
-
-With A and B running:
-
-```powershell
-.\.venv\Scripts\python.exe -m shopping.cli order `
-  --id takeover-demo --step-seconds 1 --acknowledgement-seconds 10
-```
-
-Watch which worker logs the committed payment. Stop **that worker only**, leaving
-the other worker and Temporal running. The surviving worker executes the retry
-after the heartbeat timeout/backoff and finishes the order. Inspect events to
-see the identity change; completed steps and committed side effects are preserved.
-
-### E. API outage that recovers
-
-```powershell
-.\.venv\Scripts\python.exe -m shopping.cli order `
-  --id api-recovers --scenario transient --fail-step check_inventory --wait
-```
-
-The selected API fails on attempts 1 and 2, then succeeds on attempt 3. The order
-is delivered. `--fail-step` can target `deduct_payment`, `check_inventory`, or
-`deliver_product`.
-
-### F. API stays unavailable until the retry budget expires
-
-Real 30-minute per-step budget:
-
-```powershell
-.\.venv\Scripts\python.exe -m shopping.cli order `
-  --id long-outage --scenario api-down --fail-step deliver_product --wait
-```
-
-Shortened version used for UI evidence:
-
-```powershell
-.\.venv\Scripts\python.exe -m shopping.cli order `
-  --id short-outage --scenario api-down --fail-step deliver_product `
-  --retry-seconds 20 --step-seconds 1 --wait
-```
-
-After delivery's budget expires, the workflow refunds payment, releases reserved
-stock, and fails. Total order duration includes earlier steps and compensation,
-so it can exceed the failing activity's budget.
-
-### G. Invalid payment: fail without retry
-
-```powershell
-.\.venv\Scripts\python.exe -m shopping.cli order `
-  --id declined-order --scenario invalid-payment --wait
-```
-
-Payment has exactly one attempt and no charge. Inventory and delivery never run.
-Compensation safely settles the received order without refunding money that was
-never charged. The UI shows a failed workflow, not a success-shaped result.
-`--scenario out-of-stock` similarly rejects inventory and refunds payment.
-
-## Actual UI results
-
-These are screenshots from real local executions, not mockups. Capture versions:
-Temporal CLI 1.9.1, server 1.32.0, UI 2.54.1, Python SDK 1.34.0.
-The screenshots retain local timestamps; store events use UTC.
-
-| Captured order | Observed result, verified against history/store |
-| --- | --- |
-| `ui-single-worker` | Delivered; all four activities executed by worker-A. |
-| `ui-paused` | While A was stopped: running, charged payment, no inventory reservation. After restart: delivered in the same run; receive executed once, payment retried at attempt 2 without another charge. |
-| `ui-parallel-1`, `ui-parallel-2` | Both delivered. Receive activities started at `00:11:18.094Z` on B and `00:11:18.077Z` on A, before either completed. |
-| `ui-takeover` | Interrupted payment attempt 1 on B; surviving A ran attempt 2 and delivered the order. |
-| `ui-api-recovery` | Inventory attempts 1 and 2 failed; attempt 3 succeeded; delivered. |
-| `ui-invalid-payment` | Failed; one payment attempt; payment and inventory remained `none`. |
-| `ui-api-exhausted` | **20-second delivery budget**; four delivery attempts; workflow failed with payment `refunded` and inventory `released`. |
-
-### Single-worker timeline
-
-![One worker completes the four shopping activities](docs/images/01-single-worker.png)
-
-### Same order while stopped, then after restart
-
-The pending retry does not restart the order from the beginning.
-
-![Worker stopped: receive completed and payment attempt 2 waits](docs/images/02-worker-stopped.png)
-
-![Same order after restart: payment retry and remaining steps complete](docs/images/03-worker-restarted.png)
-
-### Two orders running, and takeover after a worker fails
-
-![Two shopping workflows running at the same time](docs/images/04-parallel-orders.png)
-
-The takeover timeline's `2` beside payment represents the retried activity.
-Store events confirm B performed attempt 1 and A performed attempt 2.
-
-![Surviving worker completes the retried payment and order](docs/images/05-worker-takeover.png)
-
-### API retries, terminal payment rejection, and exhausted budget
-
-![Inventory API recovers on attempt 3](docs/images/06-api-recovery.png)
-
-![Invalid payment fails once, followed by compensation](docs/images/07-invalid-payment.png)
-
-![Delivery exhausts a shortened 20-second budget and compensation completes](docs/images/08-api-exhausted.png)
-
-### Policy and worker identity in the UI
-
-The activity detail shows the real default **30-minute Schedule To Close Timeout**.
-
-![Temporal activity configuration shows a 30-minute budget](docs/images/09-retry-policy.png)
-
-The retried payment detail shows **worker-A, attempt 2**, with a previous heartbeat
-timeout and a successful `paid` result.
-
-![Activity attempt and worker identity after restart](docs/images/10-retry-identity.png)
 
 ## Tests and validation
 
