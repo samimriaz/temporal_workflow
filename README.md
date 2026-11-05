@@ -85,32 +85,6 @@ attempt. An invalid payment or other business rejection skips retries.
 Compensation checks durable state first. A timeout is not proof that an API
 operation did not commit. Already delivered orders are not refunded.
 
-```mermaid
-sequenceDiagram
-    participant C as CLI
-    participant T as Temporal
-    participant A as Combined worker A
-    participant S as Shop database
-    participant B as Combined worker B
-    C->>T: Start ShoppingOrder
-    T->>A: Workflow task
-    A->>T: Schedule receive_order
-    T->>A: Activity task
-    A->>S: Persist order
-    A-->>T: Activity completed
-    T->>A: Workflow task
-    A->>T: Schedule deduct_payment
-    T->>A: Payment activity, attempt 1
-    A->>S: Persist charged payment
-    Note over A: Worker stops before acknowledgement
-    Note over T: Heartbeat timeout and retry scheduling
-    T->>B: Payment activity, attempt 2
-    B->>S: Check existing payment and do not charge again
-    B-->>T: Activity completed
-    T->>B: Workflow task with payment result
-    Note over T,B: Continue inventory and delivery
-```
-
 With only one worker, the retry waits until that worker restarts. With another
 healthy worker on the same queue, no manual reassignment is needed. Workflow
 code replays history to reconstruct progress; completed activities recorded in
